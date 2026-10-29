@@ -1,0 +1,17 @@
+[project]
+name = "noisy-enchilada"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "enchilada",
+    "eryn>=1.2.6",
+    "h5py>=3.14",
+    "numba",
+    "numpy>=2.3.4,<2.4", # Eryn 1.2.6 uses np.in1d, removed in NumPy 2.4.
+    "scipy>=1.18.1",
+    "wdm",
+]
+
+[tool.uv.sources]
+enchilada = { git = "https://github.com/nsgs-analysis-center/enchilada.git" }
+wdm = { git = "https://github.com/AaronDJohnson/wdm.git", rev = "6f145b4076862ea4786150a54d5a1f28af3c7055" }
