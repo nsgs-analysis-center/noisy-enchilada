@@ -218,9 +218,14 @@ wheels = [
 [[package]]
 name = "enchilada"
 version = "0.3.0"
-source = { git = "https://github.com/nsgs-analysis-center/enchilada.git#253b8e58cc1c65200f0830350f9646e8d5aa5e8e" }
+source = { git = "https://github.com/rjrosati/enchilada.git?branch=cd1l-orbit-arrays#d7d5f6f101b5736c06a0dfc9c956dd69cfadd82a" }
 dependencies = [
     { name = "numpy" },
+]
+
+[package.optional-dependencies]
+cd1l = [
+    { name = "h5py" },
 ]
 
 [[package]]
@@ -526,7 +531,7 @@ name = "noisy-enchilada"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "enchilada" },
+    { name = "enchilada", extra = ["cd1l"] },
     { name = "eryn" },
     { name = "h5py" },
     { name = "numba" },
@@ -537,7 +542,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "enchilada", git = "https://github.com/nsgs-analysis-center/enchilada.git" },
+    { name = "enchilada", extras = ["cd1l"], git = "https://github.com/rjrosati/enchilada.git?branch=cd1l-orbit-arrays" },
     { name = "eryn", specifier = ">=1.2.6" },
     { name = "h5py", specifier = ">=3.14" },
     { name = "numba" },

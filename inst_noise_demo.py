@@ -3,10 +3,10 @@
 from dataclasses import replace
 from pathlib import Path
 
-import h5py
 import numpy as np
 import wdm
-from enchilada import Block, BlockResult, DataCovariance, L1Data, NumericOrbit, Wheel, transform
+from enchilada import Block, BlockState, Covariance, L1Data, Wheel, transform
+from enchilada.data import LINKS
 from eryn.ensemble import EnsembleSampler
 from eryn.moves import StretchMove
 from eryn.prior import ProbDistContainer, UniformDistribution
@@ -15,42 +15,17 @@ from numba import njit
 from scipy import signal
 
 CHANNELS = ("X", "Y", "Z")
-LINKS = (12, 23, 31, 13, 32, 21)  # ij: received at i from j; keep both directions
 C_SI = 299792458.0
 PRIORS = np.log([[6e-12, 2e-10], [1e-15, 2e-13]])
 FIDUCIAL = (1.5e-11, 3e-15)
 UI, UJ = [0, 1, 2, 0, 0, 1], [0, 1, 2, 1, 2, 2]  # XX YY ZZ XY XZ YZ
 
-# --- Missing Enchilada helpers: issues #4 (reader) and #3 (directed LTTs) -------
-
-
-def read_cd1l(path, *, duration_s=None):
-    """XYZ TDI-2, in fractional frequency; let Enchilada load the orbit."""
-    with h5py.File(path, "r") as f:
-        sampling = f["tdis/sampling"].attrs
-        fs, t0 = float(sampling["fs"]), float(sampling["t0"])
-        count = int(sampling["size"]) if duration_s is None else int(np.ceil(duration_s * fs))
-        if not 0 < count <= sampling["size"]:
-            raise ValueError("Requested duration exceeds the brick or is non-positive")
-        data = {ch: f[f"tdis/{ch}2"][:count] / f.attrs["laser_frequency"] for ch in CHANNELS}
-    return L1Data(
-        channel_names=CHANNELS, channel_data=data, sample_rate_hz=fs,
-        start_time_gps=t0, tdi_generation="2.0", physical_observable="fractional_frequency",
-        orbit_ephemeris=NumericOrbit.from_hdf5(path),
-    )
-
-
-def read_ltts(path, stride=200):
-    """Absolute times and six directed delays in LINKS order, all in seconds."""
-    with h5py.File(path, "r") as f:
-        sampling = f["ltts/sampling"].attrs
-        t0, dt = float(sampling["t0"]), float(sampling["dt"])
-        delays = np.stack([f[f"ltts/ltt_{link}"][::stride] for link in LINKS], axis=1)
-    return t0 + np.arange(len(delays)) * dt * stride, delays
-
-
-def column_delays(times, delays, data):
-    """Average tabulated delays in cells centred on WDM time columns."""
+def column_delays(data, stride=200):
+    """Average Enchilada's directed delays in cells centred on WDM columns."""
+    if data.light_travel_times_s is None:
+        raise ValueError("Observation requires light-travel-time tables")
+    times = data.light_travel_time_sample_times_gps[::stride]
+    delays = data.light_travel_times_s[:, ::stride].T
     width = data.wdm_grid.num_frequency_divisions * data.dt
     nt = data.wdm_grid.num_time_divisions
     times = times - data.t0
@@ -69,7 +44,7 @@ def column_delays(times, delays, data):
 def load_observation(path, nf=768, nt=256, dt=5.0):
     """Reference conditioning: high-pass, resample, trim 200 h, Tukey taper."""
     trim = int(200 * 3600 / dt)
-    raw = read_cd1l(path, duration_s=(nf * nt + 2 * trim) * dt)
+    raw = L1Data.from_cd1l(str(path), duration_s=(nf * nt + 2 * trim) * dt)
     down = int(round(dt * raw.fs))
     if down < 1 or not np.isclose(down, dt * raw.fs):
         raise ValueError("dt must be an integer multiple of the input interval")
@@ -80,18 +55,19 @@ def load_observation(path, nf=768, nt=256, dt=5.0):
     data = replace(raw, channel_data=dict(zip(CHANNELS, xyz)), num_time_samples=nf * nt,
                    sample_rate_hz=1 / dt, start_time_gps=raw.t0 + trim * dt)
     data = transform(data, "wdm", num_frequency_divisions=nf, num_time_divisions=nt)
-    return data, column_delays(*read_ltts(path), data)
+    return data, column_delays(data)
 
 
 # --- Instrument model: from noise_sampler_minimal.py, with wdm's filter -------
 
 
-def unit_bases(f, d):
+def unit_bases(f, d, *, per_link=False):
     """Real XYZ TDI-2 covariances for unit OMS and acceleration levels.
 
     Port of lisatools._unequal_arm_fused. ``d`` holds the six link delays in
     LINKS order (``d_ij`` from spacecraft j to i); returns
-    ``(2, *d.shape[:-1], 3, 3, len(f))``.
+    ``(2, *d.shape[:-1], 3, 3, len(f))``. With ``per_link=True``,
+    return 12 components: six OMS, then six test masses in LINKS order.
     """
     D = np.exp(-2j * np.pi * d[..., None] * f)
     index = {link: i for i, link in enumerate(LINKS)}
@@ -111,6 +87,14 @@ def unit_bases(f, d):
     tm = eta + eta[..., rev, :] * D[..., rev, :][..., None, :, :]
     oms = (2 * np.pi * f / C_SI) ** 2 * (1 + (2e-3 / f) ** 4)
     acc = (1 + (0.4e-3 / f) ** 2) * (1 + (f / 8e-3) ** 4) / (2 * np.pi * f * C_SI) ** 2
+    if per_link:
+        # C = M diag(S_link) M†, as in SEGWO's covariance projection.
+        # Each test mass enters its own eta and the delayed reverse eta.
+        return np.stack([
+            (A[..., :, k, :][..., :, None, :] *
+             A[..., :, k, :].conj()[..., None, :, :] * spectrum).real
+            for A, spectrum in ((eta, oms), (tm, acc)) for k in range(6)
+        ])
     return np.stack(
         [
             np.einsum("...ikf,...jkf,f->...ijf", A, A.conj(), s).real
@@ -119,8 +103,8 @@ def unit_bases(f, d):
     )
 
 
-def instrument_bases(layers, grid, dt, column_ltts):
-    """Layer-calibrated WDM covariances: (2, 3, 3, layers, Nt).
+def instrument_bases(layers, grid, dt, column_ltts, unit_model=unit_bases):
+    """Layer-calibrated WDM covariances: (components, 3, 3, layers, Nt).
 
     Fold at mean delays with wdm's actual filter, then calibrate the
     column-dependent band-centre values, as in the standalone sampler.
@@ -133,11 +117,11 @@ def instrument_bases(layers, grid, dt, column_ltts):
     offsets = (np.arange(nt) - nt // 2)[keep] / (nf * nt * dt)
     f_mid = wdm.band_frequencies(nf, dt)[layers]
     ref = column_ltts.mean(axis=0)
-    exact = np.stack([unit_bases(f + offsets, ref) @ weight for f in f_mid], axis=-1)
-    approx = 0.5 * unit_bases(f_mid, ref)
+    exact = np.stack([unit_model(f + offsets, ref) @ weight for f in f_mid], axis=-1)
+    approx = 0.5 * unit_model(f_mid, ref)
     usable = np.abs(approx) > 1e-10 * np.abs(approx).max(axis=-1, keepdims=True)
     ratio = np.where(usable, exact / np.where(usable, approx, 1.0), 1.0)
-    return 0.5 * np.moveaxis(unit_bases(f_mid, column_ltts), 1, -1) * ratio[..., None]
+    return 0.5 * np.moveaxis(unit_model(f_mid, column_ltts), 1, -1) * ratio[..., None]
 
 
 @njit(cache=True)
@@ -161,14 +145,27 @@ def noise_loglike(rows, B, X, weights):
     scores = np.zeros(len(rows))
     C = np.empty(6)
     for i in range(len(rows)):
-        oms, acc = np.exp(2 * rows[i, 0]), np.exp(2 * rows[i, 1])
+        levels = np.exp(2 * rows[i])
         for p in range(X.shape[1]):
             for k in range(6):
-                C[k] = oms * B[0, k, p] + acc * B[1, k, p]
+                C[k] = 0.0
+                for component in range(B.shape[0]):
+                    C[k] += levels[component] * B[component, k, p]
             scores[i] += weights[p] * gaussian_loglike(C, X[:, p])
     return scores
 
-# --- Noise block: fixed configuration; walkers and results belong to Wheel ----
+def packed_covariance(grid, layers, columns, packed):
+    # Enchilada requires positive variance on every physical WDM pixel.
+    # Unit variance outside our fit band is a placeholder, ignored by log_likelihood.
+    pairs = {}
+    for k, (i, j) in enumerate(zip(UI, UJ)):
+        values = grid.active_mask.astype(float) if i == j else np.zeros(grid.array_shape)
+        values[np.ix_(layers, columns)] = packed[k][:, columns]
+        pairs[CHANNELS[i], CHANNELS[j]] = values
+    return Covariance(channel_names=CHANNELS, pairs=pairs)
+
+
+# --- Noise block: configuration and sampler continuation belong to the block ---
 
 
 class InstrumentNoiseBlock(Block):
@@ -179,12 +176,17 @@ class InstrumentNoiseBlock(Block):
     """
 
     name = "InstrumentNoiseBlock"
+    parameter_names = ("Soms_d", "Sa_a")
+    fiducial = np.array(FIDUCIAL)
+    priors = PRIORS
+    unit_model = staticmethod(unit_bases)
 
     def __init__(self, data, column_ltts, *, nwalkers=16, steps_per_call=100, time_slices_crop=3, coarseQ=1):
         if (data.data_domain, data.channel_names, data.tdi_generation,
                 data.physical_observable) != ("wdm", CHANNELS, "2.0", "fractional_frequency"):
             raise ValueError("Block requires WDM XYZ TDI-2 fractional-frequency data")
         self.grid, self.fs, self.t0 = data.wdm_grid, data.fs, data.t0
+        self.sampler_state = None
         self.nwalkers = nwalkers
         self.steps_per_call = steps_per_call
         self.time_slices_crop = time_slices_crop
@@ -200,12 +202,12 @@ class InstrumentNoiseBlock(Block):
         self.active_mask[np.ix_(self.layers, self.columns)] = True
         if not self.active_mask.any():
             raise ValueError("The analysis band has no WDM pixels after trimming")
-        self.bases = instrument_bases(self.layers, self.grid, data.dt, column_ltts)[:, UI, UJ]
+        self.bases = instrument_bases(self.layers, self.grid, data.dt, column_ltts, self.unit_model)[:, UI, UJ]
         self.starts = np.arange(0, len(self.columns), coarseQ)
         self.sizes = np.diff(np.append(self.starts, len(self.columns)))
         fine = self.bases[..., self.columns]
         coarse = np.add.reduceat(fine, self.starts, axis=-1) / self.sizes
-        self.coarse_bases = np.ascontiguousarray(coarse.reshape(2, 6, -1))
+        self.coarse_bases = np.ascontiguousarray(coarse.reshape(len(self.parameter_names), 6, -1))
         self.weights = np.tile(self.sizes, len(self.layers)).astype(float)
         # Publish the same piecewise-constant model used by the coarse fit.
         self.bases[..., self.columns] = np.repeat(coarse, self.sizes, axis=-1)
@@ -227,42 +229,42 @@ class InstrumentNoiseBlock(Block):
 
     def covariance(self, logs):
         packed = np.einsum("b,beft->eft", np.exp(2 * logs), self.bases)
-        matrix = np.zeros((*self.grid.array_shape, 3, 3))
-        for k, (i, j) in enumerate(zip(UI, UJ)):
-            matrix[self.layers, :, i, j] = matrix[self.layers, :, j, i] = packed[k]
-        return DataCovariance(
-            covariance_matrix=matrix, channel_names=CHANNELS, sample_rate_hz=self.fs,
-            start_time_gps=self.t0, num_time_samples=self.grid.num_time_samples,
-            data_domain="wdm", wdm_grid=self.grid, active_mask=self.active_mask,
-        )
+        return packed_covariance(self.grid, self.layers, self.columns, packed)
 
-    def _result(self, coords, iterations):
-        # Publish a fixed walker's draw, and preserve the entire ensemble.
+    def _result(self, coords):
         logs = coords[0, 0, 0]
-        return BlockResult(
-            noise_covariance=self.covariance(logs),
-            model_parameters=dict(zip(("Soms_d", "Sa_a"), map(float, np.exp(logs)))),
-            sampler_state={"coords": coords.copy(), "iterations": iterations},
+        return BlockState(
+            covariance=self.covariance(logs),
+            parameters=dict(zip(self.parameter_names, map(float, np.exp(logs)))),
         )
 
     def initial_result(self, *, rng):
-        center = np.log(FIDUCIAL)
-        coords = center + rng.normal(0, 0.05, size=(1, self.nwalkers, 1, 2))
+        center = np.log(self.fiducial)
+        coords = center + rng.normal(0, 0.05, size=(1, self.nwalkers, 1, len(center)))
         coords[0, 0, 0] = center
-        return self._result(coords, 0)
+        self.sampler_state = {"coords": coords.copy(), "iterations": 0}
+        return self._result(coords)
 
-    def sample(self, conditional_residual, noise_covariance, current_block_result, *, rng):
-        prior = ProbDistContainer({i: UniformDistribution(*b) for i, b in enumerate(PRIORS)})
+    def make_prior(self):
+        return ProbDistContainer({i: UniformDistribution(*b) for i, b in enumerate(self.priors)})
+
+    def make_moves(self):
+        return StretchMove(randomize_split=False)  # keep Wheel's RNG ownership
+
+    def sample(self, conditional_residual, covariance, current_block_state, *, rng):
+        if self.sampler_state is None:
+            raise ValueError("Call initial_result before sampling")
+        prior = self.make_prior()
         sampler = EnsembleSampler(
             self.nwalkers,
-            [2],
+            [len(self.parameter_names)],
             self.log_likelihood(conditional_residual),
             {"noise": prior},
             branch_names=["noise"],
             nleaves_max=[1],
             nleaves_min=[1],
             vectorize=True,
-            moves=StretchMove(randomize_split=False),  # avoid Eryn's global RNG shuffle
+            moves=self.make_moves(),
             tempering_kwargs={
                 "betas": np.array([1.0]),
                 "adaptive": False,
@@ -271,22 +273,30 @@ class InstrumentNoiseBlock(Block):
         )
         sampler.random_state = np.random.RandomState(int(rng.integers(2**32))).get_state()
         # Fresh State forces likelihood evaluation against this call's residual.
-        state = State({"noise": current_block_result.sampler_state["coords"].copy()})
+        state = State({"noise": self.sampler_state["coords"].copy()})
         final = sampler.run_mcmc(state, self.steps_per_call, progress=False)
-        return self._result(
-            final.branches_coords["noise"],
-            current_block_result.sampler_state["iterations"] + self.steps_per_call,
-        )
+        coords = final.branches_coords["noise"]
+        result = self._result(coords)
+        self.sampler_state = {
+            "coords": coords.copy(),
+            "iterations": self.sampler_state["iterations"] + self.steps_per_call,
+        }
+        return result
+
 
 
 if __name__ == "__main__":
     NOISE_FILE = Path(__file__).with_name("NOISE_731d_2.5s_L1_source0_0_20251206T220508924302Z.h5")
-    NF, NT, DT = 768, 256, 5.0
+    #NF, NT, DT = 768, 256, 5.0
+    NF, NT, DT = 768, 512*48 , 2.5
+
     data, delays = load_observation(NOISE_FILE, NF, NT, DT)
-    block = InstrumentNoiseBlock(data, delays, coarseQ=16)
     wheel = Wheel(data, random_seed=42)
+
+    block = InstrumentNoiseBlock(data, delays, coarseQ=32*32, nwalkers=4)
     initial = block.initial_result(rng=np.random.default_rng(42))
-    wheel.add(block, initial_block_result=initial, data_domain="wdm")
+    wheel.add(block, initial_block_state=initial, data_domain="wdm")
+
     for cycle in range(10):
         wheel.run(1)
-        print("Adding to the ledger:", wheel.ledger['InstrumentNoiseBlock'].model_parameters)
+        print("Adding to the ledger: ", wheel.ledger['InstrumentNoiseBlock'].parameters)
