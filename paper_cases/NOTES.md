@@ -6,14 +6,18 @@ arXiv:2410.17180, using this repo's noise blocks. **Provisional:** one noise
 realization per case and short chains. Read these as a smoke test of the setup,
 not as calibrated limits.
 
-Reproduce (about 19 minutes and a 7.6 GB peak memory footprint; see Memory):
+The cases were run twice: first with 50-day cells (Q = 100), then with 4-day
+cells (Q = 8) after `q_scan.py` showed Q = 100 discards much of the narrow
+templates' information (see Choosing Q). Reproduce (each set takes about 20
+minutes, with a peak memory footprint of about 8 GB; see Memory):
 
 ```sh
-uv run python rosati_littenberg_cases.py            # the six cases below
+uv run python rosati_littenberg_cases.py                  # the six cases, Q = 8
+uv run python rosati_littenberg_cases.py --coarse-q 100   # the first set
 ```
 
-Each case writes `<case>.json` (summary) and `<case>.npz` (thinned chain,
-`chain` (steps, walkers, parameters) and `names`; not committed).
+Each case writes `q<Q>/<case>.json` (summary) and `q<Q>/<case>.npz` (thinned
+chain, `chain` (steps, walkers, parameters) and `names`; not committed).
 
 ## Setup
 
@@ -22,7 +26,7 @@ Each case writes `<case>.json` (summary) and `<case>.npz` (thinned chain,
 | Duration, cadence | one year, dt = 5 s |
 | WDM grid | Nf = 8640, Nt = 730, so ΔT = Nf·dt = 12 h and layers are 11.6 µHz wide |
 | Fitted region | 0.1–8 mHz (683 layers) × 724 columns (3 cropped at each end) |
-| Coarse cells | Q = 100 columns (50 days): 8 cells, the last 24 columns long |
+| Coarse cells | Q = 8 columns (4 days): 91 cells, the last 4 columns long. First set: Q = 100 (50 days), 8 cells, the last 24 columns long |
 | Orbit | NOISE brick's directed delays, averaged per WDM column |
 | Data | Gaussian draw at full time resolution (`synthetic.simulate`) from the truth model below; the brick supplies only the grid and orbit |
 | Model | `StochasticNoiseBlock`: `UnequalArmEqualNoiseBlock` + modulated `GalacticForeground` + one SGWB template, sampled jointly |
@@ -49,40 +53,61 @@ read off the paper's corner-plot axes.
 
 ## Results
 
-Injection recovery (median and 90% interval, sampling coordinates):
+Injection recovery (median and 90% interval, sampling coordinates; the same
+data analysed with 50-day and 4-day cells):
 
-| Case | Parameter | Truth | Recovered |
-|---|---|---|---|
-| det-powerlaw | log10 A | −8.45 | −8.98 [−9.87, −7.75] |
-| | α | 0.667 | 0.52 [0.28, 0.86] |
-| | log10 Ω(3 mHz) | −11.06 | −11.03 [−11.14, −10.96] |
-| det-lognormal | log10 A | −2.500 | −2.508 [−2.522, −2.493] |
-| | log10 f⋆ | −3.699 | −3.699 [−3.704, −3.694] |
-| | log10 Δ | −0.523 | −0.527 [−0.545, −0.510] |
-| det-pt | r_b | 0.15 | 0.25 [0.12, 0.41] |
-| | b | 0.65 | 0.33 [0.04, 0.65] |
-| | log10 A | −10.40 | −10.41 [−10.47, −10.34] |
-| | log10 f_ph | −3.699 | −3.75 [−4.01, −3.67] |
+| Case | Parameter | Truth | Q = 100 | Q = 8 |
+|---|---|---|---|---|
+| det-powerlaw | log10 A | −8.45 | −8.98 [−9.87, −7.75] | −9.14 [−9.92, −8.18] |
+| | α | 0.667 | 0.52 [0.28, 0.86] | 0.48 [0.27, 0.74] |
+| | log10 Ω(3 mHz) | −11.06 | −11.03 [−11.14, −10.96] | −11.03 [−11.12, −10.96] |
+| det-lognormal | log10 A | −2.500 | −2.508 [−2.522, −2.493] | −2.503 [−2.511, −2.494] |
+| | log10 f⋆ | −3.699 | −3.699 [−3.704, −3.694] | −3.697 [−3.701, −3.694] |
+| | log10 Δ | −0.523 | −0.527 [−0.545, −0.510] | −0.530 [−0.542, −0.518] |
+| det-pt | r_b | 0.15 | 0.25 [0.12, 0.41] | 0.23 [0.11, 0.38] |
+| | b | 0.65 | 0.33 [0.04, 0.65] | 0.51 [0.16, 0.68] |
+| | log10 A | −10.40 | −10.41 [−10.47, −10.34] | −10.40 [−10.42, −10.37] |
+| | log10 f_ph | −3.699 | −3.75 [−4.01, −3.67] | −3.72 [−3.77, −3.68] |
 
-Every injected template parameter is inside its 90% interval. The power-law
-amplitude and slope trade off along a ridge; Ω at 3 mHz is the combination the
-data pin down.
+At both Q every injected template parameter is inside its 90% interval. The
+power-law amplitude and slope trade off along a ridge; Ω at 3 mHz is the
+combination the data pin down.
+
+At Q = 8 the narrow templates' intervals shrink as `q_scan.py` predicts. The
+phase-transition amplitude's interval narrows by ×2.33 (predicted ×2.34), the
+log-normal amplitude's by ×1.64 (predicted ×1.76), and the power-law
+amplitude's by ×1.22 (predicted ×1.16). The predicted factor is the ratio of reported widths,
+(σ_true · σ_post/σ_true) at Q = 100 over Q = 8. The phase-transition peak
+frequency narrows more than predicted (×3.7 against ×2.1): its Q = 100
+posterior has a long tail, which a Fisher estimate does not capture.
 
 95% upper limits, with no background in the data (a KDE of the template's
 posterior, evaluated along the amplitude at the conditioning values):
 
-| Template | This setup | Paper, synthetic confusion, 12 STFTs | Paper, no confusion |
-|---|---|---|---|
-| Power law, log10 A_p | −9.47 | −9.76 | −10.41 |
-| Log-normal, log10 A_R | −3.70 | −3.00 | −3.40 |
-| Phase transition, log10 A_ph | −12.06 | −11.36 | −11.46 |
+| Template | Q = 100 | Q = 8 | Paper, synthetic confusion, 12 STFTs | Paper, no confusion |
+|---|---|---|---|---|
+| Power law, log10 A_p | −9.47 | −9.48 | −9.76 | −10.41 |
+| Log-normal, log10 A_R | −3.70 | −3.80 | −3.00 | −3.40 |
+| Phase transition, log10 A_ph | −12.06 | −11.99 | −11.36 | −11.46 |
 
-The limits fall within 0.7 decades of the paper's. They are not expected to
+The limits fall within 0.8 decades of the paper's. They are not expected to
 match: see Differences from the paper.
 
+**Open: the limits barely depend on Q, against the Fisher prediction.** At each
+template's threshold amplitude, with its shape conditioned as the limit is,
+the Godambe width of the amplitude is still ×2.8 (log-normal) and ×2.6 (phase
+transition) larger at Q = 100 than at the pixel level, and within 4% at Q = 8.
+That predicts Q = 100 limits looser by roughly 0.2 and 0.4 dex. The realized
+shifts are +0.10 and −0.07 dex. Two likely reasons, neither checked: a
+non-detection posterior is far from Gaussian (flat down to the prior floor,
+with the template shape and foreground shape poorly constrained), so local
+curvature describes it badly; and one realization's limit fluctuates by a
+comparable amount. Settling it needs the expected limit over many noise
+draws at each Q.
+
 Convergence: the largest drift between the two halves of the kept chain is
-0.2–0.4 posterior standard deviations in every case. No autocorrelation times
-were computed.
+0.2–0.4 posterior standard deviations in every case at Q = 100, and 0.15–0.26
+at Q = 8. No autocorrelation times were computed.
 
 ## Instrument-level offset: one noise draw, not the coarse cells
 
@@ -123,10 +148,11 @@ The first attempt ran five year-long processes in parallel and exhausted the
 
 Measured as the macOS physical footprint (RSS under-reports it by about half):
 one case plateaus at 7.3 GB from its first Wheel cycle, with no growth across
-cycles. Of that, the conditioned data are 1.4 GB, freed filter temporaries
+cycles (8.0 GB at Q = 8, where the six cases took 29 minutes against 19 at
+Q = 100). Of that, the conditioned data are 1.4 GB, freed filter temporaries
 kept by malloc for reuse about 2.6 GB, and each covariance validation (a
 Cholesky factor at all 6.3 M grid pixels, repeated every Wheel cycle) adds a
-~3 GB transient. Peak over the six-case run: 7.56 GB. Two such processes at
+~3 GB transient. Peak over the six-case run: 7.56 GB at Q = 100, 8.04 GB at Q = 8. Two such processes at
 once would not fit alongside ordinary desktop use.
 
 ## Differences from the paper
@@ -208,6 +234,5 @@ For Q ≳ 30, use Welch–Satterthwaite weights. The ragged note's per-band
 regions would cut cost further, since instrument-dominated bands lose nothing
 to long cells, but the per-cycle overhead makes that unnecessary for now.
 
-The upper limits and injections above used Q = 100, so the narrow-template
-limits are looser than this setup allows. The power-law limit is barely
-affected.
+The six cases were rerun at Q = 8 (Results). The injections tightened as
+predicted; the upper limits did not move (see the open question there).

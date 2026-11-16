@@ -2,10 +2,11 @@
 
 Run: uv run python rosati_littenberg_cases.py [case ...]
 
-One year at 5 s on a WDM grid with ΔT = Nf·dt = 12 h, fitted in cells of 100
-time pixels (50 days; the paper used twelve month-long STFTs). Synthetic data
+One year at 5 s on a WDM grid with ΔT = Nf·dt = 12 h, fitted in cells of Q
+time pixels: Q = 8 (4 days) by default, chosen by q_scan.py (see
+paper_cases/NOTES.md); the paper used twelve month-long STFTs. Synthetic data
 are drawn at full time resolution with synthetic.simulate on the NOISE brick's
-grid and orbit. Results go to paper_cases/.
+grid and orbit. Results go to paper_cases/q<Q>/.
 
 The default cases are an injection recovery and an upper limit for each of the
 paper's three templates, all with synthetic non-stationary confusion noise
@@ -49,7 +50,8 @@ GALFOR_FILE = HERE / "GALFOR_731d_2.5s_L1.h5"
 MODULATION_FILE = HERE / "modulation_unequal.dat"
 OUTPUT = HERE / "paper_cases"
 
-NF, NT, DT, COARSE_Q = 8640, 730, 5.0, 100  # ΔT = 12 h, one year, 50-day cells
+NF, NT, DT = 8640, 730, 5.0  # ΔT = 12 h, one year
+COARSE_Q = 8  # 4-day cells: over 98% of the pixel-level information (q_scan.py)
 WIDE_BAND_HZ = (1e-4, 8e-3)  # the paper conditions its narrow templates at 0.2 mHz
 NODES = 8  # layers are 11.6 µHz wide: the spectra are smooth across one
 
@@ -162,7 +164,7 @@ def run_case(name, reference, bricks, delays, table, args):
         data = simulate(reference, [source.state(truth)], source.active_mask, rng=rng)
         components = ([foreground(analysis == "modulated")] if confusion else []) + [template]
 
-    block = StochasticNoiseBlock(instrument(data, COARSE_Q, band), components, nodes=NODES,
+    block = StochasticNoiseBlock(instrument(data, args.coarse_q, band), components, nodes=NODES,
                                  nwalkers=args.walkers, steps_per_call=args.steps)
     block.name = name
     wheel = Wheel(data, random_seed=args.seed)
@@ -180,7 +182,8 @@ def run_case(name, reference, bricks, delays, table, args):
     result = {"case": name, "parameters": {
         n: {"median": float(m), "5%": float(a), "95%": float(b)}
         for n, a, m, b in zip(names, low, median, high)},
-        "max_half_chain_drift_sigma": float(drift.max()), "samples": len(samples)}
+        "max_half_chain_drift_sigma": float(drift.max()), "samples": len(samples),
+        "coarse_q": args.coarse_q}
     sgwb = samples[:, -len(template.parameter_names):]
     if truth is not None:
         row = block.coordinates(np.array([truth.get(n, np.nan) for n in names]))
@@ -195,9 +198,10 @@ def run_case(name, reference, bricks, delays, table, args):
         result["upper_limit_95"] = conditional_upper_limit(
             sgwb, np.array(spec["priors"]), spec["amplitude"], spec["condition"])
         result["paper_upper_limit_95"] = paper
-    OUTPUT.mkdir(exist_ok=True)
-    np.savez_compressed(OUTPUT / f"{name}.npz", chain=kept, names=np.array(names))
-    (OUTPUT / f"{name}.json").write_text(json.dumps(result, indent=1))
+    output = OUTPUT / f"q{args.coarse_q}"
+    output.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output / f"{name}.npz", chain=kept, names=np.array(names))
+    (output / f"{name}.json").write_text(json.dumps(result, indent=1))
     return result
 
 
@@ -210,6 +214,8 @@ if __name__ == "__main__":
     parser.add_argument("--burn", type=int, default=4, help="cycles discarded")
     parser.add_argument("--thin", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--coarse-q", type=int, default=COARSE_Q,
+                        help="WDM time columns per likelihood cell")
     args = parser.parse_args()
 
     reference, delays = observation()
