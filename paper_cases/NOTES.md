@@ -100,10 +100,16 @@ within a cell. The power-law detection was rerun twice:
 | seed 2024, Q = 10 (5-day cells; 5 cycles, 2 discarded) | +2.3σ | −2.6σ | −11.03 [−11.12, −10.96] |
 
 With another seed the truth is inside both intervals, and tenfold finer cells
-leave the offsets and interval widths unchanged. The offset belongs to the
-seed-2024 draw. At this grid, Q = 100 shows no bias or under-coverage that
-Q = 10 avoids. Two draws cannot establish coverage; that needs a few dozen
-realizations (about 3 minutes each, run one at a time).
+leave the offsets unchanged: the offset belongs to the seed-2024 draw. Two
+draws cannot establish coverage; that needs a few dozen realizations (about
+3 minutes each, run one at a time).
+
+**Correction.** An earlier version of these notes concluded from the unchanged
+interval widths that Q = 100 shows no under-coverage. It does: the exact
+calculation below shows that at Q = 100 the acceleration level's true scatter
+grows by 13% while the size-weighted likelihood reports a posterior 11%
+narrower than that scatter, so the two cancel in the reported width. The
+narrow templates lose far more (next section).
 
 ## Memory
 
@@ -142,3 +148,66 @@ once would not fit alongside ordinary desktop use.
   and brick-based variants are defined in the script (`det-powerlaw-none`,
   `det-powerlaw-stationary`, `det-powerlaw-bricks`, `ul-*-none`) but were not
   run.
+
+## Choosing Q (and checking ΔT)
+
+`q_scan.py` scores the tiling and Q with the criteria of the WDM paper draft
+(`../wdm-paper`: draft2 "Optimal choice of WDM tiling" and "Welch-like
+coarse-graining", `tiling_heuristic.md`, `ragged_coarse_graining.md`,
+`ws_wishart_route1.py`). It is exact for the model at each detection case's
+truth, given independent pixels (as `synthetic.simulate` draws them), and needs
+no sampling: about 30 s and a 7.8 GB peak footprint for all three cases.
+
+For each Q it computes the Godambe information of the coarse likelihood (its
+expected Hessian H and score variance J under the true per-pixel covariances).
+That gives the actual scatter of the estimate (information, against the pixel
+likelihood), the width the coarse posterior reports (coverage), and the
+parameter directions lost, D = n − tr(F_fine⁻¹ G). Cell weights are either the
+cell size (what the blocks use now) or the Route-1 Welch–Satterthwaite ν_eff.
+
+**Tiling.** draft2 Eq. `rms_optimal_tiling` gives ΔT* = 16–18 h for these
+spectra (per band from 14 h at 1–3 mHz to 81 h below 0.3 mHz). The pixel-level
+cost of the diagonal approximation is about 4 nats per channel at ΔT = 12 h
+and 3–4 nats at ΔT*: the optimum is flat and 12 h is fine. Once Q ≥ 2 the
+neglected-dependence error (Result R3) drops to 10⁻⁵–10⁻⁸ nats, so the tiling
+barely matters after coarse-graining. The synthetic data have no correlations
+between pixels at all, so this axis only matters for real data.
+
+**Information lost at each Q** (σ_true/σ_fine; ΔT = 12 h, so Q·ΔT = Q/2 days):
+
+| Q | days | likelihood terms | power law log10 A | log-normal log10 A | phase transition log10 A | Sa_a (worst instrument) | D lost (pl / ln / pt) |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 0.5 | 494,492 | 1 | 1 | 1 | 1 | 0 / 0 / 0 |
+| 8 | 4 | 62,153 | 1.003 | 1.012 | 1.016 | 1.001 | 0.01 / 0.05 / 0.20 |
+| 16 | 8 | 31,418 | 1.010 | 1.046 | 1.061 | 1.006 | 0.04 / 0.17 / 0.60 |
+| 32 | 16 | 15,709 | 1.030 | 1.148 | 1.215 | 1.025 | 0.13 / 0.52 / 1.34 |
+| 50 | 25 | 10,245 | 1.058 | 1.295 | 1.461 | 1.053 | 0.25 / 0.92 / 1.94 |
+| 100 | 50 | 5,464 | 1.176 | 1.914 | 2.688 | 1.140 | 0.66 / 1.93 / 3.08 |
+| 362 | 181 | 1,366 | 2.33 | 9.19 | 18.9 | 1.75 | 1.78 / 3.87 / 4.86 |
+
+Why the narrow templates suffer: they peak at 0.2 mHz, where the modulated
+foreground is comparable to the background. What separates a stationary
+background from the foreground is the foreground's time modulation, and
+averaging over a large part of its six-month cycle removes it. In the ragged
+note's terms (Result R4), a cell is free only where the sensitivity
+g = ∂ln S/∂ln θ is constant within it, and g = S_gw/S tracks M(t).
+
+**Coverage with cell-size weights** (σ_post/σ_true): at least 0.99 for every
+parameter up to Q = 16; at Q = 100 it falls to 0.89 for Sa_a, 0.93 for the
+log-normal amplitude and 0.88 for the phase-transition amplitude. Route-1
+Welch–Satterthwaite weights keep it within 0.97–1.06 up to Q = 181 (slightly
+conservative).
+
+**Recommendation: Q = 8** (4-day cells) at ΔT = 12 h. Every parameter keeps
+over 98% of its pixel-level precision and coverage is exact to 0.1%, so the
+weights need no Welch–Satterthwaite correction there. Cost: the Q = 10 rerun
+above (55k terms) took about 20 s per 1000-step cycle against about 15 s at
+Q = 100, because a cycle's fixed overhead (Enchilada's covariance validation)
+dominates. Q = 16 is the cheaper fallback (6% loss on the narrow templates).
+For Q ≳ 30, use Welch–Satterthwaite weights. The ragged note's per-band
+regions would cut cost further, since instrument-dominated bands lose nothing
+to long cells, but the per-cycle overhead makes that unnecessary for now.
+
+The upper limits and injections above used Q = 100, so the narrow-template
+limits are looser than this setup allows. The power-law limit is barely
+affected.
