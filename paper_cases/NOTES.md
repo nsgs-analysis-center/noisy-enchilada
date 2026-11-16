@@ -224,15 +224,59 @@ log-normal amplitude and 0.88 for the phase-transition amplitude. Route-1
 Welch–Satterthwaite weights keep it within 0.97–1.06 up to Q = 181 (slightly
 conservative).
 
-**Recommendation: Q = 8** (4-day cells) at ΔT = 12 h. Every parameter keeps
-over 98% of its pixel-level precision and coverage is exact to 0.1%, so the
-weights need no Welch–Satterthwaite correction there. Cost: the Q = 10 rerun
-above (55k terms) took about 20 s per 1000-step cycle against about 15 s at
-Q = 100, because a cycle's fixed overhead (Enchilada's covariance validation)
-dominates. Q = 16 is the cheaper fallback (6% loss on the narrow templates).
-For Q ≳ 30, use Welch–Satterthwaite weights. The ragged note's per-band
-regions would cut cost further, since instrument-dominated bands lose nothing
-to long cells, but the per-cycle overhead makes that unnecessary for now.
+**Recommendation: Q = 8** (4-day cells) at ΔT = 12 h, or Q = 4 to squeeze out
+the last 1.5%. Q = 8 keeps every parameter within 2% of its pixel-level
+precision, and coverage is exact to 0.1%, so the weights need no
+Welch–Satterthwaite correction there. Use Welch–Satterthwaite weights for
+Q ≳ 30.
+
+Measured cost (det-pt data, 64 walkers, 6 Numba threads, one-off timing on
+this 12-core laptop):
+
+| Q | cell | terms | ms per likelihood call (32 walkers) | s per 1000-step cycle | D lost at threshold amplitude (pt / ln) |
+|---:|---:|---:|---:|---:|---|
+| 100 | 50 d | 5,464 | 8.0 | 19 | 3.47 / 2.98 |
+| 16 | 8 d | 31,418 | 10.7 | 24 | 0.98 / 0.40 |
+| 8 | 4 d | 62,153 | 14.9 | 30 | 0.36 / 0.11 |
+| 4 | 2 d | 123,623 | 20.9 | 41 | 0.10 / 0.03 |
+| 2 | 1 d | 247,246 | 34.3 | 61 | 0.02 / 0.006 |
+| 1 | 12 h | 494,492 | 57.2 | 104 | 0 (plus the ~4 nats per channel of leakage on real data) |
+
+A likelihood call is about 7–10 ms of spectrum evaluation (foreground and
+template at 683 layers × 8 nodes per walker; independent of Q) plus the Numba
+kernel over the cells (0.8 ms at Q = 100, 6.5 ms at Q = 8). Enchilada's
+per-cycle overhead is only about 3 s. An earlier version of these notes
+blamed Enchilada; that was wrong. Lost information grows roughly as Q² at
+small Q (the ragged note's Result R5) while cost falls only as 1/Q towards
+that floor, so the choice is a point on a Pareto front; Q = 4 is its knee.
+
+**Tiling at matched cost.** Relative to each tiling's own pixel likelihood,
+the information lost depends almost only on the cell duration Q·ΔT, and terms
+scale with ΔT, which favours short ΔT. But at ΔT = 6 h the 23 µHz layers
+already cost the narrow templates precision at the pixel level (4% on the
+phase-transition amplitude, 1% on the log-normal). Absolute amplitude widths
+(phase transition / log-normal, relative to 12 h at Q = 8) at matched budgets:
+
+| terms | ΔT = 6 h | ΔT = 12 h | ΔT = 24 h |
+|---|---|---|---|
+| ~124k | Q=4: 1.019 / 0.991 | Q=4: 0.985 / 0.984 | Q=4: 1.009 / 1.000 |
+| ~62k | Q=8: 1.023 / 0.995 | Q=8: 1 / 1 | Q=8: 1.071 / 1.056 |
+| ~31k | Q=16: 1.040 / 1.010 | Q=16: 1.062 / 1.057 | Q=16: 1.30 / 1.25 |
+| ~16k | Q=32: 1.108 / 1.069 | Q=32: 1.288 / 1.249 | worse |
+
+ΔT = 12 h is the right tiling from ~60k terms up (consistent with draft2's
+ΔT* = 16–18 h). ΔT = 6 h with longer Q only wins on small budgets.
+
+Ways to do better than a uniform Q, not yet tried:
+
+- Cheaper spectra. Half of each call at Q = 8 is evaluating smooth spectra on
+  683 layers × 8 nodes. Fewer nodes, or evaluating on a coarser frequency grid
+  and interpolating, would make small Q cheaper.
+- Per-band cells (ragged_coarse_graining.md, Result R5). Where the foreground
+  is negligible the noise is stationary, so sensitivities are constant in time
+  and whole-year cells lose nothing. Not measured per band here. This needs the
+  region and kernel to allow different cell counts per layer; they currently
+  assume the same number.
 
 The six cases were rerun at Q = 8 (Results). The injections tightened as
 predicted; the upper limits did not move (see the open question there).
