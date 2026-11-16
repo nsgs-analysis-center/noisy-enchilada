@@ -11,13 +11,19 @@ import numpy as np
 import wdm
 from enchilada import L1Data, WDMGrid, Wheel, transform
 
-from inst_noise_demo import (
+from noise_blocks import UnequalArmEqualNoiseBlock
+from noise_model import (
     CHANNELS,
     FIDUCIAL,
     LINKS,
-    InstrumentNoiseBlock,
+    UI,
+    UJ,
     column_delays,
     gaussian_loglike,
+    TILE,
+    _loglike_parallel,
+    _loglike_serial,
+    instrument_bases,
     unit_bases,
 )
 
@@ -46,7 +52,7 @@ def campaign():
         physical_observable="fractional_frequency",
     )
     delays = np.tile([8.1, 8.2, 8.3, 8.4, 8.5, 8.6], (32, 1))
-    block = InstrumentNoiseBlock(data, delays, nwalkers=6, steps_per_call=5)
+    block = UnequalArmEqualNoiseBlock(data, delays, nwalkers=6, steps_per_call=5)
     initial = block.initial_result(rng=np.random.default_rng(12))
     covariance = initial.covariance
     mask = block.active_mask
@@ -63,7 +69,7 @@ class InstrumentTests(unittest.TestCase):
         data, block, initial, delays = campaign()
         # Include a changing arm geometry, not just constant LTTs.
         delays *= np.linspace(0.995, 1.005, len(delays))[:, None]
-        block = InstrumentNoiseBlock(data, delays)
+        block = UnequalArmEqualNoiseBlock(data, delays)
         for amplitudes in (FIDUCIAL, (3e-11, 6e-15), (6.1e-12, 1.9e-13)):
             logs = np.log(amplitudes)
             covariance = block.covariance(logs)
@@ -88,8 +94,8 @@ class InstrumentTests(unittest.TestCase):
         data, _, _, delays = campaign()
         delays *= np.linspace(0.98, 1.02, len(delays))[:, None]
         for q in (1, 5, 100):  # includes a short final cell and one oversized cell
-            block = InstrumentNoiseBlock(data, delays, coarseQ=q)
-            self.assertEqual(block.sizes.sum(), len(block.columns))
+            block = UnequalArmEqualNoiseBlock(data, delays, coarseQ=q)
+            self.assertEqual(block.region.sizes.sum(), len(block.region.columns))
             logs = np.log(FIDUCIAL)
             cov = block.covariance(logs)
             expected = -0.5 * (reference_score(cov, data, block.active_mask))
@@ -97,7 +103,7 @@ class InstrumentTests(unittest.TestCase):
                                        [expected, expected], rtol=2e-12)
         for q in (0, -1, 1.5):
             with self.assertRaises(ValueError):
-                InstrumentNoiseBlock(data, delays, coarseQ=q)
+                UnequalArmEqualNoiseBlock(data, delays, coarseQ=q)
 
     def test_fold_agrees_with_wdm_backend(self):
         data, block, _, delays = campaign()
@@ -105,6 +111,8 @@ class InstrumentTests(unittest.TestCase):
         # Test all diagonal and cross-channel elements through v^T C v,
         # which is a nonnegative scalar PSD accepted by wdm.
         vectors = np.vstack((np.eye(3), [1, 1, 0], [1, 0, 1], [0, 1, 1]))
+        layers = block.region.layers
+        bases = instrument_bases(layers, data.wdm_grid, data.dt, delays)[:, UI, UJ]
         for basis in range(2):
             for vector in vectors:
 
@@ -112,7 +120,7 @@ class InstrumentTests(unittest.TestCase):
                     cov = unit_bases(np.maximum(f.ravel(), 1e-10), delays[0])[basis]
                     return np.einsum("i,ijf,j->f", vector, cov, vector).reshape(f.shape)
 
-                expected = wdm.band_averaged_variance(nf, nt, data.dt, psd)[block.layers]
+                expected = wdm.band_averaged_variance(nf, nt, data.dt, psd)[layers]
                 weights = np.array(
                     [
                         vector[0] ** 2,
@@ -123,7 +131,7 @@ class InstrumentTests(unittest.TestCase):
                         2 * vector[1] * vector[2],
                     ]
                 )
-                actual = np.einsum("e,eft->ft", weights, block.bases[basis])
+                actual = np.einsum("e,eft->ft", weights, bases[basis])
                 np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=0)
 
     def test_transform_scaling(self):
@@ -157,7 +165,7 @@ class InstrumentTests(unittest.TestCase):
         saved = deepcopy(block.sampler_state)
         global_rng = np.random.get_state()
         wheels = [Wheel(data, random_seed=7) for _ in range(2)]
-        blocks = [InstrumentNoiseBlock(data, campaign()[3], nwalkers=6, steps_per_call=5)
+        blocks = [UnequalArmEqualNoiseBlock(data, campaign()[3], nwalkers=6, steps_per_call=5)
                   for _ in wheels]
         for wheel, owned in zip(wheels, blocks):
             state = owned.initial_result(rng=np.random.default_rng(12))
@@ -195,6 +203,16 @@ class InstrumentTests(unittest.TestCase):
                 initial,
                 rng=np.random.default_rng(7),
             )
+
+    def test_serial_and_parallel_kernels_agree_exactly(self):
+        rng = np.random.default_rng(5)
+        pixels = 5 * TILE + 17  # includes a partial final tile
+        B = np.abs(rng.normal(size=(pixels, 12, 6)))
+        B[:, :, :3] += 10  # positive-definite pixels
+        X, weights = np.abs(rng.normal(size=(pixels, 6))), rng.uniform(1, 4, pixels)
+        levels = np.abs(rng.normal(size=(7, 12)))
+        np.testing.assert_array_equal(_loglike_serial(levels[:, None], B, X, weights),
+                                      _loglike_parallel(levels[:, None], B, X, weights))
 
     def test_non_positive_definite_covariance_rejected(self):
         self.assertEqual(

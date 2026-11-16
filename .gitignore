@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Case-study chains (summaries and notes are committed)
+paper_cases/*.npz

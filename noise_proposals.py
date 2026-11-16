@@ -1,7 +1,9 @@
-"""Small GLASS-inspired moves for our 12 log-ASD coordinates.
+"""Small GLASS-inspired moves for our per-link log-ASD coordinates.
 
-Reference: glass/sgwb-dev/noise/src/glass_noise_sampler.c. We preserve all
-12 parameters and our log-uniform prior, rather than tying reverse-link OMS.
+Reference: glass/noise/src/glass_noise_sampler.c. Coordinates are OMS levels
+followed by six test-mass levels in link order. Unequal arms keep all six OMS
+levels (12 parameters) under our log-uniform prior; equal arms tie each
+reverse OMS pair, as GLASS does, leaving three (9 parameters).
 """
 
 import numpy as np
@@ -18,16 +20,22 @@ class LinkNoiseMove(MHMove):
     Power increments use fixed nominal powers and scales 0.001, 0.01, 0.1, 1.
     Negative-power proposals are rejected, never clipped or redrawn. The
     returned Hastings factor converts symmetric power moves to log-ASD space.
+    With 12 coordinates, swaps act on OMS or acceleration pairs; with 9
+    (reverse OMS tied) they act on acceleration pairs only.
     """
 
     def __init__(self, fiducial):
         super().__init__()
         self.center = np.log(np.asarray(fiducial))
+        self.ndim = len(self.center)
+        if self.ndim not in (9, 12):
+            raise ValueError('LinkNoiseMove requires 9 (tied OMS) or 12 log ASDs')
+        self.n_oms = self.ndim - 6
 
     def get_proposal(self, branches_coords, random, **kwargs):
         coords = branches_coords['noise']
-        if coords.shape[-2:] != (1, 12):
-            raise ValueError('LinkNoiseMove requires one leaf with 12 log ASDs')
+        if coords.shape[-2:] != (1, self.ndim):
+            raise ValueError(f'LinkNoiseMove requires one leaf with {self.ndim} log ASDs')
         q = coords.copy()
         factors = np.zeros(coords.shape[:2])
         for t, w in np.ndindex(factors.shape):
@@ -36,16 +44,17 @@ class LinkNoiseMove(MHMove):
             scale = random.choice([0.001, 0.01, 0.1, 1.0])
             step = scale * random.normal()
             if kind == 0:
-                q[t, w, 0, random.randint(12)] += step
+                q[t, w, 0, random.randint(self.ndim)] += step
                 continue  # symmetric directly in log ASD
             power = np.exp(2 * (old - self.center))
             if kind == 1:
                 i, j = REVERSE_PAIRS[random.randint(3)]
-                offset = 6 * random.randint(2)  # OMS or acceleration
+                # OMS or acceleration; tied OMS pairs have no split to swap.
+                offset = self.n_oms * random.randint(2) if self.n_oms == 6 else self.n_oms
                 power[offset + i] += step
                 power[offset + j] -= step
             else:
-                power[6:] += step * ACC_CYCLE
+                power[self.n_oms:] += step * ACC_CYCLE
             if np.any(power <= 0):
                 factors[t, w] = -np.inf
                 continue

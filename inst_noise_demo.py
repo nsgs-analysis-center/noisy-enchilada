@@ -1,50 +1,32 @@
-"""Unequal-arm instrument noise demo. Run: uv run python inst_noise_demo.py"""
+"""Unequal-arm instrument noise demo. Run: uv run python inst_noise_demo.py
+
+The model lives in noise_model.py and the blocks in noise_blocks.py; this
+script conditions a CD1-L brick and runs a short Wheel campaign.
+"""
 
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-import wdm
-from enchilada import Block, BlockState, Covariance, L1Data, Wheel, transform
-from enchilada.data import LINKS
-from eryn.ensemble import EnsembleSampler
-from eryn.moves import StretchMove
-from eryn.prior import ProbDistContainer, UniformDistribution
-from eryn.state import State
-from numba import njit
+from enchilada import L1Data, Wheel, transform
 from scipy import signal
 
-CHANNELS = ("X", "Y", "Z")
-C_SI = 299792458.0
-PRIORS = np.log([[6e-12, 2e-10], [1e-15, 2e-13]])
-FIDUCIAL = (1.5e-11, 3e-15)
-UI, UJ = [0, 1, 2, 0, 0, 1], [0, 1, 2, 1, 2, 2]  # XX YY ZZ XY XZ YZ
+from noise_blocks import UnequalArmEqualNoiseBlock
+from noise_model import CHANNELS, column_delays
 
-def column_delays(data, stride=200):
-    """Average Enchilada's directed delays in cells centred on WDM columns."""
-    if data.light_travel_times_s is None:
-        raise ValueError("Observation requires light-travel-time tables")
-    times = data.light_travel_time_sample_times_gps[::stride]
-    delays = data.light_travel_times_s[:, ::stride].T
-    width = data.wdm_grid.num_frequency_divisions * data.dt
-    nt = data.wdm_grid.num_time_divisions
-    times = times - data.t0
-    if times[0] > -width / 2 or times[-1] < (nt - 0.5) * width:
-        raise ValueError("LTT table must cover the full WDM column cells")
-    columns = np.floor(times / width + 0.5).astype(int)
-    keep = (columns >= 0) & (columns < nt)
-    counts = np.bincount(columns[keep], minlength=nt)
-    if np.any(counts == 0):
-        raise ValueError("LTT subsampling leaves empty WDM columns; reduce stride")
-    return np.stack([
-        np.bincount(columns[keep], weights=d[keep], minlength=nt) / counts for d in delays.T
-    ], axis=1)
+
+TRIM_S = 200 * 3600  # dropped from each end after filtering
 
 
 def load_observation(path, nf=768, nt=256, dt=5.0):
+    """Read the start of a CD1-L brick and condition it onto the WDM grid."""
+    raw = L1Data.from_cd1l(str(path), duration_s=nf * nt * dt + 2 * TRIM_S)
+    return condition(raw, nf, nt, dt)
+
+
+def condition(raw, nf=768, nt=256, dt=5.0):
     """Reference conditioning: high-pass, resample, trim 200 h, Tukey taper."""
-    trim = int(200 * 3600 / dt)
-    raw = L1Data.from_cd1l(str(path), duration_s=(nf * nt + 2 * trim) * dt)
+    trim = int(TRIM_S / dt)
     down = int(round(dt * raw.fs))
     if down < 1 or not np.isclose(down, dt * raw.fs):
         raise ValueError("dt must be an integer multiple of the input interval")
@@ -58,233 +40,6 @@ def load_observation(path, nf=768, nt=256, dt=5.0):
     return data, column_delays(data)
 
 
-# --- Instrument model: from noise_sampler_minimal.py, with wdm's filter -------
-
-
-def unit_bases(f, d, *, per_link=False):
-    """Real XYZ TDI-2 covariances for unit OMS and acceleration levels.
-
-    Port of lisatools._unequal_arm_fused. ``d`` holds the six link delays in
-    LINKS order (``d_ij`` from spacecraft j to i); returns
-    ``(2, *d.shape[:-1], 3, 3, len(f))``. With ``per_link=True``,
-    return 12 components: six OMS, then six test masses in LINKS order.
-    """
-    D = np.exp(-2j * np.pi * d[..., None] * f)
-    index = {link: i for i, link in enumerate(LINKS)}
-    eta = np.zeros(D.shape[:-2] + (3, 6, f.size), complex)
-    for ch in range(3):
-        a1, a2, b1, b2 = (
-            index[10 * ((link // 10 + ch - 1) % 3 + 1) + (link % 10 + ch - 1) % 3 + 1]
-            for link in (13, 31, 12, 21)
-        )
-        a, b = D[..., a1, :] * D[..., a2, :], D[..., b1, :] * D[..., b2, :]
-        eta[..., ch, a1, :] = (1 - b) * (1 - a * b)
-        eta[..., ch, a2, :] = D[..., a1, :] * eta[..., ch, a1, :]
-        eta[..., ch, b1, :] = (a - 1) * (1 - a * b)
-        eta[..., ch, b2, :] = D[..., b1, :] * eta[..., ch, b1, :]
-    # a test-mass noise enters its own link directly and the reverse link delayed
-    rev = [index[int(str(link)[::-1])] for link in LINKS]
-    tm = eta + eta[..., rev, :] * D[..., rev, :][..., None, :, :]
-    oms = (2 * np.pi * f / C_SI) ** 2 * (1 + (2e-3 / f) ** 4)
-    acc = (1 + (0.4e-3 / f) ** 2) * (1 + (f / 8e-3) ** 4) / (2 * np.pi * f * C_SI) ** 2
-    if per_link:
-        # C = M diag(S_link) M†, as in SEGWO's covariance projection.
-        # Each test mass enters its own eta and the delayed reverse eta.
-        return np.stack([
-            (A[..., :, k, :][..., :, None, :] *
-             A[..., :, k, :].conj()[..., None, :, :] * spectrum).real
-            for A, spectrum in ((eta, oms), (tm, acc)) for k in range(6)
-        ])
-    return np.stack(
-        [
-            np.einsum("...ikf,...jkf,f->...ijf", A, A.conj(), s).real
-            for A, s in ((eta, oms), (tm, acc))
-        ]
-    )
-
-
-def instrument_bases(layers, grid, dt, column_ltts, unit_model=unit_bases):
-    """Layer-calibrated WDM covariances: (components, 3, 3, layers, Nt).
-
-    Fold at mean delays with wdm's actual filter, then calibrate the
-    column-dependent band-centre values, as in the standalone sampler.
-    A flat one-sided PSD folds to S/2 in the wdm normalization.
-    """
-    nf, nt = grid.num_frequency_divisions, grid.num_time_divisions
-    phi2 = wdm.phi_centered(nf, nt, dt) ** 2
-    keep = phi2 > 0
-    weight = 0.5 * phi2[keep] / phi2.sum()
-    offsets = (np.arange(nt) - nt // 2)[keep] / (nf * nt * dt)
-    f_mid = wdm.band_frequencies(nf, dt)[layers]
-    ref = column_ltts.mean(axis=0)
-    exact = np.stack([unit_model(f + offsets, ref) @ weight for f in f_mid], axis=-1)
-    approx = 0.5 * unit_model(f_mid, ref)
-    usable = np.abs(approx) > 1e-10 * np.abs(approx).max(axis=-1, keepdims=True)
-    ratio = np.where(usable, exact / np.where(usable, approx, 1.0), 1.0)
-    return 0.5 * np.moveaxis(unit_model(f_mid, column_ltts), 1, -1) * ratio[..., None]
-
-
-@njit(cache=True)
-def gaussian_loglike(C, X):
-    """One real XYZ pixel; X contains doubled cross products."""
-    xx, yy, zz, xy, xz, yz = C
-    cof = (yy * zz - yz**2, xx * zz - xz**2, xx * yy - xy**2,
-           xz * yz - zz * xy, xy * yz - yy * xz, xy * xz - xx * yz)
-    det = xx * cof[0] + xy * cof[3] + xz * cof[4]
-    if xx <= 0 or cof[2] <= 0 or det <= 0:
-        return -np.inf
-    quad = 0.0
-    for k in range(6):
-        quad += cof[k] * X[k]
-    return -0.5 * (quad / det + np.log(det))
-
-
-@njit(cache=True)
-def noise_loglike(rows, B, X, weights):
-    """Fused walker/pixel loop; no full covariance allocation per proposal."""
-    scores = np.zeros(len(rows))
-    C = np.empty(6)
-    for i in range(len(rows)):
-        levels = np.exp(2 * rows[i])
-        for p in range(X.shape[1]):
-            for k in range(6):
-                C[k] = 0.0
-                for component in range(B.shape[0]):
-                    C[k] += levels[component] * B[component, k, p]
-            scores[i] += weights[p] * gaussian_loglike(C, X[:, p])
-    return scores
-
-def packed_covariance(grid, layers, columns, packed):
-    # Enchilada requires positive variance on every physical WDM pixel.
-    # Unit variance outside our fit band is a placeholder, ignored by log_likelihood.
-    pairs = {}
-    for k, (i, j) in enumerate(zip(UI, UJ)):
-        values = grid.active_mask.astype(float) if i == j else np.zeros(grid.array_shape)
-        values[np.ix_(layers, columns)] = packed[k][:, columns]
-        pairs[CHANNELS[i], CHANNELS[j]] = values
-    return Covariance(channel_names=CHANNELS, pairs=pairs)
-
-
-# --- Noise block: configuration and sampler continuation belong to the block ---
-
-
-class InstrumentNoiseBlock(Block):
-    """
-    Two-parameter instrument-only covariance, 0.3–8 mHz
-    Translated from the unequal-arm model we used in CD1-L analyses.
-    Assumes all links have equal and stationary Sacc and Soms
-    """
-
-    name = "InstrumentNoiseBlock"
-    parameter_names = ("Soms_d", "Sa_a")
-    fiducial = np.array(FIDUCIAL)
-    priors = PRIORS
-    unit_model = staticmethod(unit_bases)
-
-    def __init__(self, data, column_ltts, *, nwalkers=16, steps_per_call=100, time_slices_crop=3, coarseQ=1):
-        if (data.data_domain, data.channel_names, data.tdi_generation,
-                data.physical_observable) != ("wdm", CHANNELS, "2.0", "fractional_frequency"):
-            raise ValueError("Block requires WDM XYZ TDI-2 fractional-frequency data")
-        self.grid, self.fs, self.t0 = data.wdm_grid, data.fs, data.t0
-        self.sampler_state = None
-        self.nwalkers = nwalkers
-        self.steps_per_call = steps_per_call
-        self.time_slices_crop = time_slices_crop
-        if not isinstance(coarseQ, (int, np.integer)) or coarseQ < 1:
-            raise ValueError("coarseQ must be a positive integer")
-        f = wdm.band_frequencies(self.grid.num_frequency_divisions, data.dt)
-        self.layers = np.flatnonzero((f >= 3e-4) & (f <= 8e-3) & (f < data.fny))
-        self.active_mask = np.zeros(self.grid.array_shape, dtype=bool)
-        if not 0 <= 2 * time_slices_crop < self.grid.num_time_divisions:
-            raise ValueError("Cropping must leave active columns")
-        stop = self.grid.num_time_divisions - time_slices_crop
-        self.columns = np.arange(time_slices_crop, stop)
-        self.active_mask[np.ix_(self.layers, self.columns)] = True
-        if not self.active_mask.any():
-            raise ValueError("The analysis band has no WDM pixels after trimming")
-        self.bases = instrument_bases(self.layers, self.grid, data.dt, column_ltts, self.unit_model)[:, UI, UJ]
-        self.starts = np.arange(0, len(self.columns), coarseQ)
-        self.sizes = np.diff(np.append(self.starts, len(self.columns)))
-        fine = self.bases[..., self.columns]
-        coarse = np.add.reduceat(fine, self.starts, axis=-1) / self.sizes
-        self.coarse_bases = np.ascontiguousarray(coarse.reshape(len(self.parameter_names), 6, -1))
-        self.weights = np.tile(self.sizes, len(self.layers)).astype(float)
-        # Publish the same piecewise-constant model used by the coarse fit.
-        self.bases[..., self.columns] = np.repeat(coarse, self.sizes, axis=-1)
-
-    def log_likelihood(self, data):
-        if (data.wdm_grid, data.fs, data.t0, data.channel_names) != (
-                self.grid, self.fs, self.t0, CHANNELS):
-            raise ValueError("Residual grid, epoch and channels must match the block")
-        w = np.stack([data.channel_data[ch][self.layers] for ch in CHANNELS])
-        w = w[..., self.columns]
-        products = w[UI] * w[UJ] * np.array([1, 1, 1, 2, 2, 2])[:, None, None]
-        X = np.add.reduceat(products, self.starts, axis=-1) / self.sizes
-        X = np.ascontiguousarray(X.reshape(6, -1))
-
-        def loglike(rows):
-            return noise_loglike(np.atleast_2d(rows), self.coarse_bases, X, self.weights)
-
-        return loglike
-
-    def covariance(self, logs):
-        packed = np.einsum("b,beft->eft", np.exp(2 * logs), self.bases)
-        return packed_covariance(self.grid, self.layers, self.columns, packed)
-
-    def _result(self, coords):
-        logs = coords[0, 0, 0]
-        return BlockState(
-            covariance=self.covariance(logs),
-            parameters=dict(zip(self.parameter_names, map(float, np.exp(logs)))),
-        )
-
-    def initial_result(self, *, rng):
-        center = np.log(self.fiducial)
-        coords = center + rng.normal(0, 0.05, size=(1, self.nwalkers, 1, len(center)))
-        coords[0, 0, 0] = center
-        self.sampler_state = {"coords": coords.copy(), "iterations": 0}
-        return self._result(coords)
-
-    def make_prior(self):
-        return ProbDistContainer({i: UniformDistribution(*b) for i, b in enumerate(self.priors)})
-
-    def make_moves(self):
-        return StretchMove(randomize_split=False)  # keep Wheel's RNG ownership
-
-    def sample(self, conditional_residual, covariance, current_block_state, *, rng):
-        if self.sampler_state is None:
-            raise ValueError("Call initial_result before sampling")
-        prior = self.make_prior()
-        sampler = EnsembleSampler(
-            self.nwalkers,
-            [len(self.parameter_names)],
-            self.log_likelihood(conditional_residual),
-            {"noise": prior},
-            branch_names=["noise"],
-            nleaves_max=[1],
-            nleaves_min=[1],
-            vectorize=True,
-            moves=self.make_moves(),
-            tempering_kwargs={
-                "betas": np.array([1.0]),
-                "adaptive": False,
-                "permute": False
-                },
-        )
-        sampler.random_state = np.random.RandomState(int(rng.integers(2**32))).get_state()
-        # Fresh State forces likelihood evaluation against this call's residual.
-        state = State({"noise": self.sampler_state["coords"].copy()})
-        final = sampler.run_mcmc(state, self.steps_per_call, progress=False)
-        coords = final.branches_coords["noise"]
-        result = self._result(coords)
-        self.sampler_state = {
-            "coords": coords.copy(),
-            "iterations": self.sampler_state["iterations"] + self.steps_per_call,
-        }
-        return result
-
-
-
 if __name__ == "__main__":
     NOISE_FILE = Path(__file__).with_name("NOISE_731d_2.5s_L1_source0_0_20251206T220508924302Z.h5")
     #NF, NT, DT = 768, 256, 5.0
@@ -293,10 +48,10 @@ if __name__ == "__main__":
     data, delays = load_observation(NOISE_FILE, NF, NT, DT)
     wheel = Wheel(data, random_seed=42)
 
-    block = InstrumentNoiseBlock(data, delays, coarseQ=32*32, nwalkers=4)
+    block = UnequalArmEqualNoiseBlock(data, delays, coarseQ=32*32, nwalkers=4)
     initial = block.initial_result(rng=np.random.default_rng(42))
     wheel.add(block, initial_block_state=initial, data_domain="wdm")
 
     for cycle in range(10):
         wheel.run(1)
-        print("Adding to the ledger: ", wheel.ledger['InstrumentNoiseBlock'].parameters)
+        print("Adding to the ledger: ", wheel.ledger[block.name].parameters)

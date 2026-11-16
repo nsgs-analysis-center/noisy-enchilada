@@ -218,7 +218,7 @@ wheels = [
 [[package]]
 name = "enchilada"
 version = "0.3.0"
-source = { git = "https://github.com/rjrosati/enchilada.git?branch=cd1l-orbit-arrays#d7d5f6f101b5736c06a0dfc9c956dd69cfadd82a" }
+source = { git = "https://github.com/rjrosati/enchilada.git?branch=cd1l-orbit-arrays#0000cf550341e87c3e79e9d9733ade800dd95548" }
 dependencies = [
     { name = "numpy" },
 ]

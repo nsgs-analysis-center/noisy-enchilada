@@ -5,9 +5,9 @@ from copy import deepcopy
 import numpy as np
 from enchilada import Wheel
 
-from noise_blocks import LinkNoiseBlock
+from noise_blocks import UnequalArmUnequalNoiseBlock
 from noise_proposals import ACC_CYCLE, LinkNoiseMove, OMSPairPrior, REVERSE_PAIRS
-from test_inst_noise_demo import campaign
+from test_noise_model import campaign
 
 
 class FixedDraws:
@@ -30,7 +30,7 @@ class FixedDraws:
 class ProposalTests(unittest.TestCase):
     def test_power_moves_are_reversible_with_correct_jacobian(self):
         center = np.linspace(-34., -25., 12)
-        # Reverse pairs have the same nominal scale, as in LinkNoiseBlock.
+        # Reverse pairs have the same nominal scale, as in UnequalArmUnequalNoiseBlock.
         center[:6] = -25.
         center[6:] = -34.
         move = LinkNoiseMove(np.exp(center))
@@ -51,6 +51,26 @@ class ProposalTests(unittest.TestCase):
             reverse, reverse_factor = move.get_proposal(proposed, FixedDraws(kind, -.1, family))
             np.testing.assert_allclose(reverse['noise'], old, atol=1e-14)
             np.testing.assert_allclose(reverse_factor, -factor, atol=1e-14)
+
+    def test_tied_oms_layout_swaps_acceleration_only(self):
+        center = np.r_[np.full(3, -25.), np.full(6, -34.)]
+        move = LinkNoiseMove(np.exp(center))
+        old = (center + np.linspace(-.05, .05, 9))[None, None, None, :]
+        for kind, family in ((1, 0), (1, 1), (2, 0)):
+            proposed, factor = move.get_proposal({'noise': old}, FixedDraws(kind, .1, family))
+            change = (np.exp(2 * (proposed['noise']-center)) - np.exp(2 * (old-center))).ravel()
+            expected = np.zeros(9)
+            if kind == 1:  # family is never drawn: OMS pairs are tied
+                i, j = REVERSE_PAIRS[0]
+                expected[3+i], expected[3+j] = .1, -.1
+            else:
+                expected[3:] = .1 * ACC_CYCLE
+            np.testing.assert_allclose(change, expected, atol=2e-14)
+            reverse, reverse_factor = move.get_proposal(proposed, FixedDraws(kind, -.1, family))
+            np.testing.assert_allclose(reverse['noise'], old, atol=1e-14)
+            np.testing.assert_allclose(reverse_factor, -factor, atol=1e-14)
+        with self.assertRaises(ValueError):
+            LinkNoiseMove(np.ones(10))
 
     def test_invalid_power_step_is_rejected_without_clipping(self):
         move = LinkNoiseMove(np.ones(12))
@@ -76,7 +96,7 @@ class ProposalTests(unittest.TestCase):
         global_rng = deepcopy(np.random.get_state())
         wheels, blocks = [], []
         for _ in range(2):
-            block = LinkNoiseBlock(data, delays, steps_per_call=10,
+            block = UnequalArmUnequalNoiseBlock(data, delays, steps_per_call=10,
                                    oms_log_power_ratio_sigma=.5)
             initial = block.initial_result(rng=np.random.default_rng(1))
             wheel = Wheel(data, random_seed=7)
@@ -93,7 +113,7 @@ class ProposalTests(unittest.TestCase):
         self.assertIs(blocks[0].make_prior(), blocks[0].link_prior)
         self.assertTrue(np.isfinite(blocks[0].link_prior.logpdf(
             blocks[0].sampler_state['coords'])).all())
-        baseline = LinkNoiseBlock(data, delays, targeted_proposals=False)
+        baseline = UnequalArmUnequalNoiseBlock(data, delays, targeted_proposals=False)
         self.assertNotIsInstance(baseline.make_moves(), list)
 
 

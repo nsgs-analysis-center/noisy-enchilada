@@ -8,6 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import inst_noise_demo as demo
+import noise_blocks
 
 
 def tau(chain):
@@ -22,7 +23,7 @@ def tau(chain):
                      for p in range(chain.shape[-1])])
 
 
-class RecordingSampler(demo.EnsembleSampler):
+class RecordingSampler(noise_blocks.EnsembleSampler):
     latest = None
 
     def run_mcmc(self, *args, **kwargs):
@@ -32,7 +33,7 @@ class RecordingSampler(demo.EnsembleSampler):
 
 
 if __name__ == '__main__':
-    demo.EnsembleSampler = RecordingSampler
+    noise_blocks.EnsembleSampler = RecordingSampler
     path = Path(demo.__file__).with_name('NOISE_731d_2.5s_L1_source0_0_20251206T220508924302Z.h5')
     # Same frequency resolution and cadence as the current demo, shorter duration.
     data, delays = demo.load_observation(path, nf=768, nt=256, dt=2.5)
@@ -40,8 +41,8 @@ if __name__ == '__main__':
     for walkers in (4, 16):
         for seed in (42, 123):
             start = time.perf_counter()
-            block = demo.InstrumentNoiseBlock(data, delays, coarseQ=1024,
-                                              nwalkers=walkers, steps_per_call=12000)
+            block = noise_blocks.UnequalArmEqualNoiseBlock(
+                data, delays, coarseQ=1024, nwalkers=walkers, steps_per_call=12000)
             initial = block.initial_result(rng=np.random.default_rng(seed))
             block.sample(data, None, initial, rng=np.random.default_rng(seed + 1))
             sampler = RecordingSampler.latest
